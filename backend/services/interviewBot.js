@@ -48,19 +48,71 @@ class InterviewBot extends ActivityHandler {
 
         const meetingId = this.getMeetingId(context);
         
-        // Echo for testing
-        const replyText = `Echo: ${context.activity.text}`;
+        // Get or create RealtimeService session for this conversation
+        let realtimeService = this.realtimeSessions.get(meetingId);
         
+        if (!realtimeService) {
+          logger.info('Creating new RealtimeService session', { meetingId });
+          realtimeService = new RealtimeService();
+          
+          // Set up event handlers
+          realtimeService.onResponseText = (text) => {
+            logger.debug('Received response text from OpenAI', { text });
+          };
+          
+          realtimeService.onError = (error) => {
+            logger.error('RealtimeService error', { error: error.message });
+          };
+          
+          // Connect to OpenAI Realtime API
+          try {
+            await realtimeService.connect({
+              modalities: ['text'],
+              instructions: 'You are an AI interview assistant. Answer questions professionally and helpfully.',
+              voice: 'alloy',
+              temperature: 0.8,
+            });
+            
+            this.realtimeSessions.set(meetingId, realtimeService);
+            logger.info('RealtimeService connected successfully', { meetingId });
+          } catch (connectError) {
+            logger.error('Failed to connect RealtimeService', {
+              error: connectError.message,
+              stack: connectError.stack,
+            });
+            // Fall back to echo mode if connection fails
+            const replyText = `Echo: ${context.activity.text}`;
+            await context.sendActivity(MessageFactory.text(replyText, replyText));
+            await next();
+            return;
+          }
+        }
+        
+        // Send user message to OpenAI and get response
         try {
-          await context.sendActivity(MessageFactory.text(replyText, replyText));
-          logger.info('Response sent successfully');
-        } catch (sendError) {
-          logger.error('Error sending response:', {
-            message: sendError.message,
-            stack: sendError.stack,
+          logger.info('Sending message to OpenAI', { text: context.activity.text });
+          
+          // Send the user's text to OpenAI
+          await realtimeService.sendText(context.activity.text);
+          
+          // Wait for response (with timeout)
+          const response = await this.waitForResponse(realtimeService, 10000);
+          
+          if (response) {
+            await context.sendActivity(MessageFactory.text(response, response));
+            logger.info('AI response sent successfully');
+          } else {
+            await context.sendActivity('I\'m thinking... (response timeout)');
+            logger.warn('No response received from OpenAI within timeout');
+          }
+        } catch (aiError) {
+          logger.error('Error getting AI response', {
+            error: aiError.message,
+            stack: aiError.stack,
           });
-          // Don't throw - just log the error
-          console.error('Could not send response:', sendError.message);
+          
+          // Fallback response
+          await context.sendActivity('Sorry, I had trouble processing that. Please try again.');
         }
 
         await next();
@@ -633,6 +685,56 @@ Keep responses natural and conversational. Speak clearly at a moderate pace.`;
     } catch (error) {
       logger.error('Error handling meeting end:', error);
     }
+  }
+
+  /**
+   * Wait for response from RealtimeService
+   * @param {RealtimeService} realtimeService - The realtime service instance
+   * @param {number} timeout - Timeout in milliseconds
+   * @returns {Promise<string|null>} Response text or null if timeout
+   */
+  async waitForResponse(realtimeService, timeout = 10000) {
+    return new Promise((resolve) => {
+      let responseText = '';
+      let timeoutId;
+      
+      // Set up response handler
+      const originalHandler = realtimeService.onResponseText;
+      realtimeService.onResponseText = (text) => {
+        responseText += text;
+        
+        // Call original handler if it exists
+        if (originalHandler) {
+          originalHandler(text);
+        }
+      };
+      
+      // Set up completion handler
+      const originalDoneHandler = realtimeService.onResponseDone;
+      realtimeService.onResponseDone = () => {
+        clearTimeout(timeoutId);
+        
+        // Restore original handler
+        realtimeService.onResponseText = originalHandler;
+        realtimeService.onResponseDone = originalDoneHandler;
+        
+        resolve(responseText || null);
+        
+        // Call original done handler if it exists
+        if (originalDoneHandler) {
+          originalDoneHandler();
+        }
+      };
+      
+      // Set timeout
+      timeoutId = setTimeout(() => {
+        // Restore original handlers
+        realtimeService.onResponseText = originalHandler;
+        realtimeService.onResponseDone = originalDoneHandler;
+        
+        resolve(responseText || null);
+      }, timeout);
+    });
   }
 }
 

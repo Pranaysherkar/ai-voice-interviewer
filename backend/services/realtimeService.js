@@ -110,17 +110,15 @@ class RealtimeService {
       });
 
       return new Promise((resolve, reject) => {
-        let sessionConfigured = false;
+        let sessionCreated = false;
+        let connectionResolved = false;
         
         this.ws.on('open', () => {
           logger.info('Connected to Realtime API', {
             provider: this.isAzure ? 'Azure OpenAI' : 'Standard OpenAI',
           });
           this.isConnected = true;
-          
-          // Wait for session.created before configuring
-          // The session will be configured when we receive session.created event
-          resolve();
+          // Don't resolve yet - wait for session.created
         });
 
         this.ws.on('error', (error) => {
@@ -145,18 +143,48 @@ class RealtimeService {
           // Attempt reconnection if not intentionally closed
           if (code !== 1000) { // 1000 = normal closure
             logger.info('Attempting to reconnect to Realtime API...');
-            this.reconnect();
+            this.reconnect(config);
           }
         });
 
         this.ws.on('message', (data) => {
           try {
             const message = JSON.parse(data.toString());
+            
+            // Handle session.created BEFORE other handlers
+            if (message.type === 'session.created') {
+              logger.info('Session created:', message.session?.id);
+              sessionCreated = true;
+              
+              // Configure session after it's created
+              if (config && Object.keys(config).length > 0) {
+                this.configureSession(config);
+              } else if (this.pendingConfig) {
+                this.configureSession(this.pendingConfig);
+                this.pendingConfig = null;
+              }
+              
+              // Resolve connection promise now that session is ready
+              if (!connectionResolved) {
+                connectionResolved = true;
+                resolve();
+              }
+            }
+            
             this.handleMessage(message);
           } catch (error) {
             logger.error('Error parsing WebSocket message:', error);
           }
         });
+        
+        // Timeout if session.created doesn't arrive within 10 seconds
+        setTimeout(() => {
+          if (!connectionResolved) {
+            connectionResolved = true;
+            logger.warn('Session created timeout - resolving connection anyway');
+            resolve(); // Resolve anyway to prevent hanging
+          }
+        }, 10000);
       });
     } catch (error) {
       logger.error('Failed to connect to Realtime API:', error);
@@ -175,28 +203,41 @@ class RealtimeService {
       return;
     }
 
+    // Determine modalities - use config if provided, otherwise default to text+audio
+    const modalities = config.modalities || ['text'];
+    
     const sessionConfig = {
       type: 'session.update',
       session: {
-        modalities: ['text', 'audio'],
-        voice: config.voice || 'alloy',
+        modalities: modalities,
         instructions: config.instructions || this.getDefaultInstructions(),
-        input_audio_format: 'pcm16',
-        output_audio_format: 'pcm16',
-        input_audio_transcription: {
-          model: 'whisper-1',
-        },
-        turn_detection: {
-          type: 'server_vad',
-          threshold: 0.5,
-          prefix_padding_ms: 300,
-          silence_duration_ms: 500,
-        },
       },
     };
 
+    // Only add audio-related config if audio is in modalities
+    if (modalities.includes('audio')) {
+      sessionConfig.session.voice = config.voice || 'alloy';
+      sessionConfig.session.input_audio_format = 'pcm16';
+      sessionConfig.session.output_audio_format = 'pcm16';
+      sessionConfig.session.input_audio_transcription = {
+        model: 'whisper-1',
+      };
+      sessionConfig.session.turn_detection = {
+        type: 'server_vad',
+        threshold: 0.5,
+        prefix_padding_ms: 300,
+        silence_duration_ms: 500,
+      };
+    }
+
     this.send(sessionConfig);
-    logger.info('Realtime session configured');
+    logger.info('Realtime session configured', { 
+      modalities: modalities,
+      hasInstructions: !!sessionConfig.session.instructions 
+    });
+    
+    // Mark session as configured
+    this.sessionConfigured = true;
   }
 
   /**
@@ -303,7 +344,8 @@ Keep your responses natural and conversational. Speak clearly and at a moderate 
   handleMessage(message) {
     switch (message.type) {
       case 'session.created':
-        logger.info('Session created:', message.session.id);
+        // Already handled in connect() message handler
+        logger.debug('Session created event (already processed):', message.session?.id);
         break;
 
       case 'session.updated':
@@ -330,12 +372,113 @@ Keep your responses natural and conversational. Speak clearly and at a moderate 
         break;
 
       case 'response.text.delta':
-        // Text response chunk (for logging)
-        logger.debug('Text response:', message.delta);
+        // Text response chunk (streaming)
+        logger.info('Text response delta received', { delta: message.delta });
+        if (this.onResponseText) {
+          this.onResponseText(message.delta);
+        }
+        break;
+
+      case 'response.output_item.added':
+        // Output item added (might contain text or audio with transcript)
+        logger.debug('Response output item added', { item: message.item });
+        if (message.item?.content) {
+          const contentArray = Array.isArray(message.item.content)
+            ? message.item.content
+            : [message.item.content];
+          
+          for (const content of contentArray) {
+            // Handle text content
+            if (content.type === 'text' && content.text) {
+              logger.info('Extracted text from output_item.added', { text: content.text });
+              if (this.onResponseText) {
+                this.onResponseText(content.text);
+              }
+            }
+            // Handle audio content with transcript
+            else if (content.type === 'output_audio' && content.transcript) {
+              logger.info('Extracted transcript from output_audio in output_item.added', { transcript: content.transcript });
+              if (this.onResponseText) {
+                this.onResponseText(content.transcript);
+              }
+            }
+          }
+        }
+        break;
+
+      case 'response.output_item.done':
+        // Individual output item completed
+        logger.debug('Response output item done', { item: message.item });
+        if (message.item?.content) {
+          // Handle array of content items
+          const contentArray = Array.isArray(message.item.content) 
+            ? message.item.content 
+            : [message.item.content];
+          
+          for (const content of contentArray) {
+            // Handle text content
+            if (content.type === 'text' && content.text) {
+              logger.debug('Extracted text from output_item', { text: content.text });
+              if (this.onResponseText) {
+                this.onResponseText(content.text);
+              }
+            }
+            // Handle audio content with transcript
+            else if (content.type === 'output_audio' && content.transcript) {
+              logger.info('Extracted transcript from output_audio in output_item.done', { transcript: content.transcript });
+              if (this.onResponseText) {
+                this.onResponseText(content.transcript);
+              }
+            }
+          }
+        }
         break;
 
       case 'response.done':
-        logger.info('Response complete');
+        logger.info('Response complete', { 
+          response: message.response,
+          status: message.status 
+        });
+        
+        // Check if response contains text or audio with transcript
+        if (message.response?.output) {
+          logger.debug('Response output found', { output: message.response.output });
+          // Handle output array
+          const outputArray = Array.isArray(message.response.output) 
+            ? message.response.output 
+            : [message.response.output];
+          
+          for (const output of outputArray) {
+            // Direct text output
+            if (output.type === 'text' && output.text && this.onResponseText) {
+              logger.debug('Extracted text from response.done', { text: output.text });
+              this.onResponseText(output.text);
+            } 
+            // Message with content array
+            else if (output.content) {
+              const contentArray = Array.isArray(output.content)
+                ? output.content
+                : [output.content];
+              
+              for (const content of contentArray) {
+                // Text content
+                if (content.type === 'text' && content.text && this.onResponseText) {
+                  logger.info('Extracted text from response.done content', { text: content.text });
+                  this.onResponseText(content.text);
+                }
+                // Audio content with transcript
+                else if (content.type === 'output_audio' && content.transcript && this.onResponseText) {
+                  logger.info('Extracted transcript from output_audio in response.done', { transcript: content.transcript });
+                  this.onResponseText(content.transcript);
+                }
+              }
+            }
+          }
+        }
+        
+        if (this.onResponseDone) {
+          this.onResponseDone();
+        }
         break;
 
       case 'input_audio_buffer.speech_started':
