@@ -92,17 +92,22 @@ class InterviewBot extends ActivityHandler {
         try {
           logger.info('Sending message to OpenAI', { text: context.activity.text });
           
+          // Send typing indicator to Teams
+          await context.sendActivities([
+            { type: 'typing' }
+          ]);
+          
           // Send the user's text to OpenAI
           await realtimeService.sendText(context.activity.text);
           
-          // Wait for response (with timeout)
-          const response = await this.waitForResponse(realtimeService, 10000);
+          // Wait for response (with 30 second timeout for longer responses)
+          const response = await this.waitForResponse(realtimeService, 30000);
           
           if (response) {
             await context.sendActivity(MessageFactory.text(response, response));
             logger.info('AI response sent successfully');
           } else {
-            await context.sendActivity('I\'m thinking... (response timeout)');
+            await context.sendActivity('I\'m thinking... (response timeout after 30 seconds)');
             logger.warn('No response received from OpenAI within timeout');
           }
         } catch (aiError) {
